@@ -9,6 +9,7 @@ const clientEngineerRoutes = require("../subRoutes/admin/clientEngineerRoutes.js
 const clientPricingRoutes = require("../subRoutes/admin/clientPricingRoutes.js");
 const clientDataCenterRoutes = require("../subRoutes/admin/clientDataCenterRoutes.js");
 const reportsRoutes = require("../subRoutes/admin/reportsRoutes.js");
+const dashboardRoutes = require("../subRoutes/admin/dashboardRoutes.js");
 
 const router = express.Router();
 
@@ -22,6 +23,7 @@ router.use("/clientengineers", clientEngineerRoutes)
 router.use("/clientpricing", clientPricingRoutes)
 router.use("/clientdatacenters", clientDataCenterRoutes)
 router.use("/reports", reportsRoutes);
+router.use("/dashboard", dashboardRoutes);
 
 
 module.exports = router;

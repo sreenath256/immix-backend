@@ -74,6 +74,7 @@ const getAllClients = async (req, res) => {
         const limitNum = parseInt(limit);
         const skip = (pageNum - 1) * limitNum;
 
+
         let filter = {};
 
         if (isActive) filter.isActive = isActive === 'true';
@@ -102,6 +103,7 @@ const getAllClients = async (req, res) => {
                 .skip(skip)
                 .limit(limitNum)
         ]);
+
 
         res.json({
             success: true,

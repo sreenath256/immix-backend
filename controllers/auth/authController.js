@@ -12,21 +12,10 @@ const createToken = (_id) => {
 const cookieConfig = {
   httpOnly: true,
   secure: process.env.NODE_ENV === "production", // Only true in production
-  sameSite: "none", // recommended for CSRF protection
-  // sameSite: "strict", // recommended for CSRF protection
+  // sameSite: "none", // recommended for CSRF protection
+  sameSite: "strict", // recommended for CSRF protection
   maxAge: 1000 * 60 * 60 * 24, // 1 day
 };
-
-
-
-// const cookieConfig = {
-//   httpOnly: true,
-//   secure: process.env.NODE_ENV === "production", // Only true in production
-//   sameSite: "none", // recommended for CSRF protection
-//   // sameSite: "strict", // recommended for CSRF protection
-//   maxAge: 1000 * 60 * 60 * 24, // 1 day
-// };
-
 
 
 // To get user data on initial page load.

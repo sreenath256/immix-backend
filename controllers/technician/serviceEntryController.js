@@ -27,34 +27,37 @@ function calculateDuration(entry, end) {
 const createServiceEntry = async (req, res) => {
   try {
     const ftId = req.user.id;
-    // 1️⃣ Extract text fields
-    // REMOVED 'bills' from here because we will build it manually
     const {
       date, country, city, dataCenterId, clientId,
       workType, referenceNo, additionalFTCount,
       additionalFTIds, clientEngineerId, entryTime,
-      endTime, totalBillsExpense, workDescription
+      endTime, standardDuration, offStandardDuration, totalDuration, totalBillsExpense, workDescription
     } = req.body;
 
     console.log(req.body)
-    // 2️⃣ Process Files (The Fix)
-    let billUrls = []; // Create a local variable to hold the URLs
 
+    // 1️⃣ Calculate Total Man-Hours
+    const start = new Date(`${date}T${entryTime}`);
+    const end = new Date(`${date}T${endTime}`);
+
+    // Calculate difference in hours
+    // (end - start) gives milliseconds, divide by 3.6e+6 to get decimal hours
+    const durationInHours = (end - start) / (1000 * 60 * 60);
+
+    // Total people = Main FT (1) + Additional FTs
+    const totalStaff = 1 + (Number(additionalFTCount) || 0);
+    const totalManHours = durationInHours * totalStaff;
+
+    // 2️⃣ Process Files
+    let billUrls = [];
     if (req.files && req.files.length > 0) {
-      // Map correctly: Use 'file.key' (not req.files.key)
       billUrls = req.files.map((file) => {
-        // Construct your R2 URL
         return `${process.env.R2_PUBLIC_ENDPOINT}/${encodeURIComponent(file.key || file.originalname)}`;
       });
     }
 
     // 3️⃣ Check Permissions
-    const permissionExists = await FTPermission.findOne({
-      ftId,
-      dataCenterId,
-      clientId
-    });
-
+    const permissionExists = await FTPermission.findOne({ ftId, dataCenterId, clientId });
     if (!permissionExists) {
       return res.status(403).json({
         success: false,
@@ -62,8 +65,7 @@ const createServiceEntry = async (req, res) => {
       });
     }
 
-
-    // 5️⃣ Save entry
+    // 4️⃣ Save entry (Adding the calculated hours)
     const entry = await ServiceEntry.create({
       ftId,
       date,
@@ -78,13 +80,15 @@ const createServiceEntry = async (req, res) => {
       clientEngineerId,
       entryTime,
       endTime,
+      standardDuration,
+      offStandardDuration,
+      totalDuration,
       totalBillsExpense,
       workDescription,
-      bills: billUrls // ✅ PASS THE PROCESSED URLs HERE
+      bills: billUrls,
+      totalManHours: totalManHours.toFixed(2) // Adding this to your schema
     });
 
-
-    // Populate the entry before sending response
     await entry.populate("country city clientId clientEngineerId");
     await entry.populate("additionalFTIds", "name");
 
@@ -184,6 +188,7 @@ const updateServiceEntry = async (req, res) => {
       additionalFTCount: Number(req.body.additionalFTCount || 0),
       entryTime: req.body.entryTime,
       endTime: req.body.endTime,
+      totalDuration: req.body.totalDuration,
       totalBillsExpense: Number(req.body.totalBillsExpense || 0),
       workDescription: req.body.workDescription,
     };

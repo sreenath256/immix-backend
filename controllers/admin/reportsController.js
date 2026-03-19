@@ -568,10 +568,470 @@ const getDataCenterDurationSummary = async (req, res) => {
     }
 };
 
+const getFieldTechniciansWorkSummary = async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+
+        // 1. Build Date Filter
+        const matchStage = {};
+        if (startDate && endDate) {
+            matchStage.date = {
+                $gte: new Date(startDate),
+                $lte: new Date(endDate + 'T23:59:59.999Z')
+            };
+        }
+
+        const summary = await ServiceEntry.aggregate([
+            // --- Step 1: Filter by Date ---
+            { $match: matchStage },
+
+            // --- Step 2: Calculate Duration per Entry (in Minutes) ---
+            {
+                $addFields: {
+                    startParts: { $split: ["$entryTime", ":"] },
+                    endParts: { $split: ["$endTime", ":"] }
+                }
+            },
+            {
+                $addFields: {
+                    startMinTotal: {
+                        $add: [
+                            { $multiply: [{ $toInt: { $arrayElemAt: ["$startParts", 0] } }, 60] },
+                            { $toInt: { $arrayElemAt: ["$startParts", 1] } }
+                        ]
+                    },
+                    endMinTotal: {
+                        $add: [
+                            { $multiply: [{ $toInt: { $arrayElemAt: ["$endParts", 0] } }, 60] },
+                            { $toInt: { $arrayElemAt: ["$endParts", 1] } }
+                        ]
+                    }
+                }
+            },
+            {
+                $addFields: {
+                    durationInMinutes: {
+                        $cond: {
+                            if: { $gte: ["$endMinTotal", "$startMinTotal"] },
+                            then: { $subtract: ["$endMinTotal", "$startMinTotal"] },
+                            else: { $subtract: [{ $add: ["$endMinTotal", 1440] }, "$startMinTotal"] }
+                        }
+                    }
+                }
+            },
+
+            // --- Step 3: Group by Technician ---
+            {
+                $group: {
+                    _id: "$ftId",
+                    totalEntries: { $sum: 1 },
+                    totalExpenses: { $sum: "$totalBillsExpense" },
+                    totalWorkMinutes: { $sum: "$durationInMinutes" }
+                }
+            },
+
+            // --- Step 4A: Get Technician Details ---
+            {
+                $lookup: {
+                    from: "fieldtechnicians", // Must be the exact collection name in DB
+                    localField: "_id",
+                    foreignField: "_id",
+                    as: "technicianInfo"
+                }
+            },
+            { $unwind: "$technicianInfo" },
+
+            // --- Step 4B: Get Company Details (NEW) ---
+            {
+                $lookup: {
+                    from: "companies", // ⚠️ IMPORTANT: Change this to your actual Company collection name in MongoDB (usually lowercase & pluralized)
+                    localField: "technicianInfo.companyId", // Matches the field inside the technician model
+                    foreignField: "_id",
+                    as: "companyInfo"
+                }
+            },
+            {
+                $unwind: {
+                    path: "$companyInfo",
+                    preserveNullAndEmptyArrays: true // Keeps the technician in the list even if they don't have a company assigned
+                }
+            },
+
+            // --- Step 5: Format the Output ---
+            {
+                $project: {
+                    _id: 1,
+                    technicianName: "$technicianInfo.name",
+                    companyName: "$companyInfo.name", // <-- Grabs the name from the populated companyInfo
+                    totalEntries: 1,
+                    totalExpenses: 1,
+                    totalDuration: {
+                        $concat: [
+                            { $toString: { $floor: { $divide: ["$totalWorkMinutes", 60] } } },
+                            ":",
+                            {
+                                $cond: {
+                                    if: { $lt: [{ $mod: ["$totalWorkMinutes", 60] }, 10] },
+                                    then: { $concat: ["0", { $toString: { $mod: ["$totalWorkMinutes", 60] } }] },
+                                    else: { $toString: { $mod: ["$totalWorkMinutes", 60] } }
+                                }
+                            }
+                        ]
+                    },
+                    rawTotalMinutes: "$totalWorkMinutes"
+                }
+            },
+            { $sort: { technicianName: 1 } }
+        ]);
+        console.log(summary)
+        res.status(200).json({ success: true, data: summary });
+
+    } catch (error) {
+        console.error("Error fetching summary:", error);
+        res.status(500).json({ success: false, message: "Server Error" });
+    }
+};
+
+// -----------------------------------------------------------------------------
+// 7. Get Client Billing Report
+// -----------------------------------------------------------------------------
+const getClientBillingReport = async (req, res) => {
+    try {
+        const { clientId, startDate, endDate, dataCenterId } = req.query;
+
+        // Validation
+        if (!clientId || !startDate || !endDate) {
+            return res.status(400).json({ success: false, message: "clientId, startDate, and endDate are required" });
+        }
+
+        const query = {
+            clientId: clientId,
+            date: {
+                $gte: new Date(startDate),
+                $lte: new Date(endDate + 'T23:59:59.999Z')
+            }
+        };
+
+        if (dataCenterId) {
+            query.dataCenterId = dataCenterId;
+        }
+
+        // Fetch matching ServiceEntry documents
+        const logs = await ServiceEntry.find(query)
+            .populate("dataCenterId", "name")
+            .populate("ftId", "name")
+            .populate("additionalFTIds", "name")
+            .lean();
+
+        // Fetch ClientPricing documents
+        const pricingRecords = await ClientPricing.find({ clientId: clientId }).lean();
+        const pricingMap = {};
+        pricingRecords.forEach(p => {
+            // Map by countryId
+            pricingMap[p.countryId.toString()] = p;
+        });
+
+        // Helper function to parse HH:mm
+        const parseDurationToDecimal = (durationStr) => {
+            if (!durationStr || typeof durationStr !== 'string') return 0;
+
+            // 1. Check if the string contains 'h' (e.g., "15h 0m")
+            if (durationStr.includes('h') || durationStr.includes('m')) {
+                // Extract the digits right before 'h' and 'm'
+                const hMatch = durationStr.match(/(\d+)\s*h/);
+                const mMatch = durationStr.match(/(\d+)\s*m/);
+
+                const h = hMatch ? Number(hMatch[1]) : 0;
+                const m = mMatch ? Number(mMatch[1]) : 0;
+
+                return h + (m / 60);
+            }
+
+            // 2. Fallback for the original "15:00" format
+            const [h, m] = durationStr.split(':').map(Number);
+            return (h || 0) + ((m || 0) / 60);
+        };
+
+        const summary = {
+            totalBillableStdHours: 0,
+            totalBillableOffStdHours: 0,
+            totalBillsExpense: 0,
+            totalEntryAmount: 0,
+            totalAmountToBePaid: 0 // <-- ADDED
+        };
+
+        const resultEntries = [];
+
+        logs.forEach(log => {
+            const countryId = log.country ? log.country.toString() : null;
+            const pricing = countryId ? pricingMap[countryId] : null;
+
+            const standardHourlyRate = pricing ? (pricing.standardHourlyRate || 0) : 0;
+            const offStandardHourlyRate = pricing ? (pricing.offStandardHourlyRate || 0) : 0;
+
+            const techCount = 1 + (log.additionalFTIds ? log.additionalFTIds.length : 0);
+
+            const decimalStdHours = parseDurationToDecimal(log.standardDuration);
+            const decimalOffStdHours = parseDurationToDecimal(log.offStandardDuration);
+
+            // Double check: Should these be multiplied by techCount? 
+            // e.g., const billableStdHours = decimalStdHours * techCount;
+            const billableStdHours = decimalStdHours;
+            const billableOffStdHours = decimalOffStdHours;
+            const totalBillsExpense = log.totalBillsExpense || 0;
+
+            const totalEntryAmount = (billableStdHours * standardHourlyRate) + (billableOffStdHours * offStandardHourlyRate) + totalBillsExpense;
+
+            // BUG FIX: Changed '=' to '+=' to properly accumulate the totals
+            summary.totalBillableStdHours += billableStdHours;
+            summary.totalBillableOffStdHours += billableOffStdHours;
+            summary.totalBillsExpense += totalBillsExpense;
+            summary.totalEntryAmount += totalEntryAmount;
+            summary.totalAmountToBePaid += totalEntryAmount; // <-- ADDED
+
+            // Formulate tooltip math strings
+            const tooltipMath = `${log.standardDuration} actual standard hours of ${techCount} technicians. = ${billableStdHours.toFixed(2)} billable std hours, ${log.offStandardDuration} actual off-standard hours x ${techCount} technicians = ${billableOffStdHours.toFixed(2)} billable off-std hours`;
+
+            resultEntries.push({
+                ...log,
+                calculated: {
+                    techCount,
+                    decimalStdHours: roundToTwo(decimalStdHours),
+                    decimalOffStdHours: roundToTwo(decimalOffStdHours),
+                    totalBillsExpense: roundToTwo(totalBillsExpense),
+                    billableStdHours: roundToTwo(billableStdHours),
+                    billableOffStdHours: roundToTwo(billableOffStdHours),
+                    standardHourlyRate,
+                    offStandardHourlyRate,
+                    totalEntryAmount: roundToTwo(totalEntryAmount),
+                    tooltipMath
+                }
+            });
+        });
+
+        // Returning the final rounded summary
+        res.status(200).json({
+            success: true,
+            summary: {
+                totalBillableStdHours: roundToTwo(summary.totalBillableStdHours),
+                totalBillableOffStdHours: roundToTwo(summary.totalBillableOffStdHours),
+                totalBillsExpense: roundToTwo(summary.totalBillsExpense),
+                totalEntryAmount: roundToTwo(summary.totalEntryAmount),
+                totalAmountToBePaid: roundToTwo(summary.totalAmountToBePaid) // <-- ADDED
+            },
+            entries: resultEntries
+        });
+
+    } catch (error) {
+        console.error("Error fetching client billing report:", error);
+        res.status(500).json({ success: false, message: "Server Error" });
+    }
+};
+
+// -----------------------------------------------------------------------------
+// 8. Get Technician Payroll
+// -----------------------------------------------------------------------------
+// Helper function to safely round numbers to 2 decimal places
+const roundToTwo = (num) => {
+    return Math.round((num + Number.EPSILON) * 100) / 100;
+};
+
+const getTechnicianPayroll = async (req, res) => {
+    try {
+        const { ftId, startDate, endDate } = req.query;
+
+        // Validation
+        if (!ftId || !startDate || !endDate) {
+            return res.status(400).json({ success: false, message: "ftId, startDate, and endDate are required" });
+        }
+
+        const query = {
+            $or: [
+                { ftId: ftId },
+                { additionalFTIds: ftId }
+            ],
+            date: {
+                $gte: new Date(startDate),
+                $lte: new Date(endDate + 'T23:59:59.999Z')
+            }
+        };
+
+        console.log("query", query);
+
+        // Fetch matching ServiceEntry documents
+        // We need dataCenterId (locationType, commuteTime), clientId & country (for ClientPricing)
+        const logs = await ServiceEntry.find(query)
+            .populate("dataCenterId", "name locationType commuteTimeInMinutes")
+            .populate("clientId", "name")
+            .populate("country", "name")
+            .lean();
+
+        // Fetch the technician to know their standard/off-standard rates and if commute is provided
+        const technician = await FieldTechnician.findById(ftId).lean();
+        if (!technician) {
+            return res.status(404).json({ success: false, message: "Technician not found" });
+        }
+
+        // Gather unique clientId-countryId pairs to fetch ClientPricing for commute rates
+        const pricingKeys = logs.map(log => ({
+            clientId: log.clientId?._id,
+            countryId: log.country?._id
+        })).filter(k => k.clientId && k.countryId);
+
+        const uniqueKeys = [...new Set(pricingKeys.map(k => JSON.stringify(k)))].map(k => JSON.parse(k));
+
+        let pricingMap = {};
+        if (uniqueKeys.length > 0) {
+            const pricingQuery = {
+                $or: uniqueKeys.map(k => ({
+                    clientId: k.clientId,
+                    countryId: k.countryId
+                }))
+            };
+            const pricingRecords = await ClientPricing.find(pricingQuery).lean();
+            pricingRecords.forEach(p => {
+                const key = `${p.clientId.toString()}_${p.countryId.toString()}`;
+                pricingMap[key] = p;
+            });
+        }
+
+        const summary = {
+            totalStandardHours: 0,
+            totalOffStandardHours: 0,
+            totalHours: 0,
+            totalBaseCost: 0,
+            totalCommuteCost: 0,
+            totalBillsExpense: 0, // <-- ADDED
+            totalAmountToBePaid: 0
+        };
+
+        const resultEntries = [];
+
+        logs.forEach(log => {
+            // Hours Calculation (Calculated for a single technician using entry and exit times)
+            const { standardHours: decimalStdHours, offStandardHours: decimalOffStdHours } = calculateShiftSplit(log.entryTime, log.endTime);
+            const totalEntryHours = decimalStdHours + decimalOffStdHours;
+
+            // Base Cost Calculation (from FieldTechnician rate)
+            const standardPay = decimalStdHours * (technician.standardRate || 0);
+            const offStandardPay = decimalOffStdHours * (technician.offStandardRate || 0);
+            const entryBaseCost = standardPay + offStandardPay;
+
+            // Commute Calculation
+            let commutePay = 0;
+            let commuteHours = 0;
+            let commuteHourlyRate = 0;
+            let isOutofCity = false;
+
+            // Check if commute should be paid
+            if (
+                technician.isCommuteProvided &&
+                log.dataCenterId &&
+                log.dataCenterId.locationType === "outside_city_limits"
+            ) {
+                isOutofCity = true;
+                const commuteMins = log.dataCenterId.commuteTimeInMinutes || 0;
+                commuteHours = commuteMins / 60;
+
+                // Lookup Commute Rate from Client Pricing
+                if (log.clientId && log.country) {
+                    const priceKey = `${log.clientId._id.toString()}_${log.country._id.toString()}`;
+                    const pricing = pricingMap[priceKey];
+                    if (pricing) {
+                        commuteHourlyRate = pricing.commuteHourlyRate || 0;
+                        commutePay = commuteHours * commuteHourlyRate;
+                    }
+                }
+            }
+
+            // Extract bills expense (default to 0 if not present)
+            const billsExpense = log.totalBillsExpense || 0; // <-- ADDED
+
+            // Add billsExpense to the total pay for this entry
+            const totalEntryPay = entryBaseCost + commutePay + billsExpense; // <-- MODIFIED
+
+            // Aggregate totals (Keep math unrounded here to prevent precision loss)
+            summary.totalStandardHours += decimalStdHours;
+            summary.totalOffStandardHours += decimalOffStdHours;
+            summary.totalHours += totalEntryHours;
+            summary.totalBaseCost += entryBaseCost;
+            summary.totalCommuteCost += commutePay;
+            summary.totalBillsExpense += billsExpense; // <-- ADDED
+            summary.totalAmountToBePaid += totalEntryPay;
+
+            // Tooltip Strings (Using .toFixed(2) here is perfect since tooltips are strings)
+            const commuteTooltip = isOutofCity
+                ? `${commuteHours.toFixed(2)} commute hours x ${commuteHourlyRate} commute rate = ${commutePay.toFixed(2)}`
+                : technician.isCommuteProvided
+                    ? `Data Center is within city limits. Commute not applied.`
+                    : `Technician does not have commute provision.`;
+
+            // Modified tooltip to include bills expense
+            const mathTooltip = `${decimalStdHours.toFixed(2)} std hours x ${technician.standardRate} rate = ${standardPay.toFixed(2)} base pay\n${decimalOffStdHours.toFixed(2)} off-std hours x ${technician.offStandardRate} rate = ${offStandardPay.toFixed(2)} base pay\nTotal Base = ${entryBaseCost.toFixed(2)}. ${commuteTooltip}\nBills Expense = ${billsExpense.toFixed(2)}\nTotal Entry Pay = ${totalEntryPay.toFixed(2)}`;
+
+            const techCount = 1 + (log.additionalFTIds ? log.additionalFTIds.length : 0);
+
+            resultEntries.push({
+                ...log,
+                calculated: {
+                    // Applying roundToTwo to all numerical outputs
+                    techCount,
+                    decimalStdHours: roundToTwo(decimalStdHours),
+                    decimalOffStdHours: roundToTwo(decimalOffStdHours),
+                    totalEntryHours: roundToTwo(totalEntryHours),
+                    technicianStandardRate: technician.standardRate,
+                    technicianOffStandardRate: technician.offStandardRate,
+                    standardPay: roundToTwo(standardPay),
+                    offStandardPay: roundToTwo(offStandardPay),
+                    entryBaseCost: roundToTwo(entryBaseCost),
+                    isOutofCity,
+                    commuteHours: roundToTwo(commuteHours),
+                    clientCommuteRate: commuteHourlyRate,
+                    commutePay: roundToTwo(commutePay),
+                    billsExpense: roundToTwo(billsExpense), // <-- ADDED
+                    totalEntryPay: roundToTwo(totalEntryPay),
+                    mathTooltip
+                }
+            });
+        });
+
+        res.status(200).json({
+            success: true,
+            summary: {
+                // Applying roundToTwo to all final summary numbers
+                totalStandardHours: roundToTwo(summary.totalStandardHours),
+                totalOffStandardHours: roundToTwo(summary.totalOffStandardHours),
+                totalHours: roundToTwo(summary.totalHours),
+                totalBaseCost: roundToTwo(summary.totalBaseCost),
+                totalCommuteCost: roundToTwo(summary.totalCommuteCost),
+                totalBillsExpense: roundToTwo(summary.totalBillsExpense), // <-- ADDED
+                totalAmountToBePaid: roundToTwo(summary.totalAmountToBePaid)
+            },
+            technician: {
+                id: technician._id,
+                name: technician.name,
+                standardRate: technician.standardRate,
+                offStandardRate: technician.offStandardRate,
+                isCommuteProvided: technician.isCommuteProvided,
+                pricingCurrency: technician.pricingCurrency
+            },
+            entries: resultEntries
+        });
+
+    } catch (error) {
+        console.error("Error fetching technician payroll:", error);
+        res.status(500).json({ success: false, message: "Server Error" });
+    }
+};
+
+
 module.exports = {
     getDailyWorkReports,
     getWorkSummaryMetrics,
     getDetailedWorkLogs,
     getDataCenterWorkSummary,
-    getDataCenterDurationSummary
+    getDataCenterDurationSummary,
+    getFieldTechniciansWorkSummary,
+    getClientBillingReport,
+    getTechnicianPayroll
 };
