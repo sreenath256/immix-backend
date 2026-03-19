@@ -20,8 +20,9 @@ const cookieConfig = {
 const baseCookieConfig = {
   httpOnly: true,
   secure: process.env.NODE_ENV === "production", 
-  sameSite: "strict", 
-  path: "/", // CRITICAL: explicitly declare the path
+  // Allow cross-port cookie modifications in local dev
+  sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax", 
+  path: "/", 
 };
 
 // To get user data on initial page load.
